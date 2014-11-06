@@ -10,6 +10,7 @@ window.onload = function () {
 		}
 	};
 
+
 	var canvas = document.getElementById("canvas");
 	var ctx = canvas.getContext("2d");
 
@@ -28,6 +29,12 @@ window.onload = function () {
 	var dot = function (v1, v2) {
 		return v1[0] * v2[0] + v1[1] * v2[1];
 	};
+	var cross = function (v1, v2) {
+		return v1[0] * v2[1] - v1[1] * v2[0];
+	};
+	var crossZ = function (v, z) {
+		return [-v[1] * z, v[0] * z];
+	};
 	var plus = function (v1, v2) {
 		return [v1[0] + v2[0], v1[1] + v2[1]];
 	};
@@ -37,16 +44,21 @@ window.onload = function () {
 	var scale = function (v, s) {
 		return [v[0] * s, v[1] * s];
 	};
+	var rotate = function (v, a) {
+		var c = Math.cos(a);
+		var s = Math.sin(a);
+		return [c * v[0] - s * v[1], s * v[0] + c * v[1]];
+	};
 	var normalize = function (v) {
 		return scale(v, 1 / magnitude(v));
 	};
 	var project = function (v1, v2) {
-		v2 = normalize(v2);
-		return [v1[0] * Math.abs(v2[0]), v1[1] * Math.abs(v2[1])];
+		return scale(v2, dot(v1, v2) / magnitude2(v2));
 	};
 
 
 	var ec = 0.001; // electric constant
+	var mc = 0.01; // magnetic constant
 	var g = 0.0; // acceleration due to gravity
 
 	var collisionType = {
@@ -73,10 +85,10 @@ window.onload = function () {
 
 		// here are the ways we can interact with physics bodies
 		obj.applyForce = function (f) {
-			var mass = obj.mass;
-			var vel = obj.vel;
-			var accel = [f[0] / mass, f[1] / mass];
-			obj.vel = plus(vel, accel);
+			obj.vel = plus(obj.vel, scale(f, 1 / obj.mass));
+		};
+		obj.applyTorque = function (t) {
+			obj.angleVel = obj.angleVel + t / obj.momentOfInertia;
 		};
 
 		// some derived propoerties
@@ -91,6 +103,10 @@ window.onload = function () {
 			var area = 4 * Math.PI * distance * distance;
 			var e = scale(displacement, obj.charge / (distance * area * ec));
 			return e;
+		};
+		obj.magneticField = function (p) {
+			// todo
+			return 0;
 		};
 		return obj;
 	};
@@ -132,7 +148,37 @@ window.onload = function () {
 		}
 		else if (body1.collisionType === collisionType.circle &&
 				 body2.collisionType === collisionType.convexPoly) {
-			
+			// For each edge, check if the closest point to
+			// the center of the circle is inside the circle.
+			var p = minus(body1.pos, body2.pos);
+			var points = body2.collisionPoints.slice();
+			points.push(points[0]);
+			for (var i = 0; i < points.length - 1; i++) {
+				var point1 = minus(rotate(points[i], body2.angle), p); 
+				var point2 = minus(rotate(points[i + 1], body2.angle), p);
+
+				// compute the "velocity" of the edge and the "time
+				// index" at which the distance to the center of the
+				// circle is minimized
+				var pointV = minus(point2, point1);
+				var a = magnitude2(pointV);
+				var b = 2 * dot(point1, pointV);
+				var minT = -b / (2 * a);
+
+				if (minT >= 0 && minT <= 1) {
+					var point = plus(point1, scale(pointV, minT));
+					if (magnitude(point) <= body1.collisionRadius) {
+						var circleNormal = normalize(point);
+						return {
+							point1: circleNormal,
+							point2: {
+								i: i,
+								t: minT,
+							}
+						};
+					}
+				}
+			}
 		}
 	};
 
@@ -142,8 +188,6 @@ window.onload = function () {
 			if (body1.collisionType === collisionType.circle &&
 				body2.collisionType === collisionType.circle) {
 				var t = coll.t;
-				var pos1 = plus(body1.pos, scale(body1.vel, t));
-				var pos2 = plus(body2.pos, scale(body2.vel, t));
 				var vel1Normal = project(body1.vel, coll.point1);
 				var vel2Normal = project(body2.vel, coll.point2);
 				var cr = body1.elasticity * body2.elasticity;
@@ -151,15 +195,29 @@ window.onload = function () {
 				// http://en.wikipedia.org/wiki/Inelastic_collision
 				var vel1Normal2 = scale(
 					plus(scale(minus(vel2Normal, vel1Normal), cr * body2.mass),
-						 plus(scale(body1.vel, body1.mass),
-							  scale(body2.vel, body2.mass))), 1 / (body1.mass + body2.mass));
+						 plus(scale(vel1Normal, body1.mass),
+							  scale(vel2Normal, body2.mass))), 1 / (body1.mass + body2.mass));
 				var vel2Normal2 = scale(
 					plus(scale(minus(vel1Normal, vel2Normal), cr * body1.mass),
 						 plus(scale(vel1Normal, body1.mass),
 							  scale(vel2Normal, body2.mass))), 1 / (body1.mass + body2.mass));
 
-				body1.vel = plus(minus(body1.vel, vel1Normal), vel1Normal2);
-				body2.vel = plus(minus(body2.vel, vel2Normal), vel2Normal2);
+				body1.applyForce(scale(minus(vel1Normal2, vel1Normal), body1.mass));
+				body2.applyForce(scale(minus(vel2Normal2, vel2Normal), body2.mass));
+			}
+			else if (body1.collisionType === collisionType.circle &&
+					 body2.collisionType === collisionType.convexPoly) {
+				var points = body2.collisionPoints.slice();
+				points.push(points[0]);
+				var pointi = rotate(points[coll.point2.i], body2.angle);
+				var pointi2 = rotate(points[coll.point2.i + 1], body2.angle);
+				var pointV = minus(pointi2, pointi);
+				var point2 = plus(pointi, scale(pointV, coll.point2.t));
+				var cr = body1.elasticity * body2.elasticity;
+				
+				// black magic ahead
+				// see http://en.wikipedia.org/wiki/Collision_response
+				var j_r = (-1 - cr)
 			}
 		}
 	};
@@ -197,7 +255,33 @@ window.onload = function () {
 	var mkBlock = function (obj, width, height) {
 		obj = obj || {};
 		mkPhysicsBody(obj);
-		obj
+		var x = width / 2;
+		var y = height / 2;
+		obj.mass = width * height / 300;
+		obj.momentOfInertia = obj.mass * 3;
+		obj.collisionType = collisionType.convexPoly;
+		obj.collisionPoints = [[-x, -y],
+							   [-x, y],
+							   [x, y],
+							   [x, -y]];
+		obj.draw = function (ctx) {
+			var pos = obj.pos;
+			ctx.save();
+			ctx.translate(pos[0], pos[1]);
+			ctx.rotate(obj.angle);
+			ctx.beginPath();
+			ctx.strokeStyle = "#000000";
+			ctx.fillStyle = "#000000";
+			ctx.moveTo(-x, -y);
+			ctx.lineTo(-x, y);
+			ctx.lineTo(x, y);
+			ctx.lineTo(x, -y);
+			ctx.lineTo(-x, -y);
+			ctx.stroke();
+			ctx.fill();
+			ctx.restore();
+		};
+		return obj;
 	};
 
 	var startPhysicsSystem = function (bodies) {
@@ -219,15 +303,18 @@ window.onload = function () {
 				var gf = scale([0, 1], g * body.mass);
 				body.applyForce(gf);
 
-				// apply electric force
+				// apply force based on charge and electric and vetical magnetic fields
 				if (body.q !== 0) {
 					var e = [0, 0];
+					var m = 0;
 					for (var j = 0; j < bodies.length; j++) {
 						if (i !== j) {
 							e = plus(e, bodies[j].electricField(body.pos));
+							m = m + bodies[j].magneticField(body.pos);
 						}
 					}
 					body.applyForce(scale(e, body.charge));
+					body.applyForce(scale(crossZ(body.vel, m), body.charge));
 				}
 			}
 		}, 16);
@@ -282,7 +369,18 @@ window.onload = function () {
 	};
 
 
+	var mkWall = function (obj, minXY, maxXY, thickness) {
+		
+	};
 
+	var mkUniformMagneticField = function (obj, magnitude) {
+		obj = obj || {};
+		mkPhysicsBody(obj);
+		obj.magneticField = function () {
+			return magnitude * mc;
+		};
+		return obj;
+	};
 
 	// finally, put the game together
 	var circle = mkCircle({}, 8);
@@ -298,7 +396,6 @@ window.onload = function () {
 	var circle3 = mkCircle({}, 8);
 	circle3.pos = [85, 20];
 
-
 	var circle4 = mkCircle({}, 8);
 	circle4.pos = [300, 450];
 	circle4.charge = 1;
@@ -308,6 +405,11 @@ window.onload = function () {
 	circle5.pos = [340, 450];
 	circle5.charge = -1;
 	circle5.vel = [0, 0.9];
+	
+	var block = mkBlock({}, 120, 10);
+	block.pos = [230, 230];
+
+	var ambientMagneticField = mkUniformMagneticField({}, 1);
 
 
 	var level1Physics = [
@@ -316,6 +418,8 @@ window.onload = function () {
 		circle3,
 		circle4,
 		circle5,
+		// block,
+		ambientMagneticField,
 	];
 
 	var ff = mkForceField(level1Physics, [0, 0], [640, 480], 40);
@@ -326,6 +430,7 @@ window.onload = function () {
 		circle3,
 		circle4,
 		circle5,
+		// block,
 		ff,
 	];
 
